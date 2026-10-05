@@ -1,0 +1,24 @@
+id = "bagonyi.restore-commands"
+name = "Restore Commands"
+version = "0.1.0"
+min_herdr_version = "0.9.3"
+description = "Bring back chosen commands, such as gh dash, in their panes when a session restarts"
+platforms = ["linux", "macos"]
+
+# Hands over to a background worker and returns at once. The worker restores
+# the session's last snapshot, then saves a new one every few seconds until
+# the server stops.
+[[startup]]
+command = ["python3", "restore_commands.py", "start"]
+
+# Saving now also starts the worker in a session that was already running
+# when the plugin was linked.
+[[actions]]
+id = "save"
+title = "Save the listed commands running in panes"
+command = ["python3", "restore_commands.py", "save"]
+
+[[actions]]
+id = "restore"
+title = "Restore saved commands into their panes"
+command = ["python3", "restore_commands.py", "restore"]
