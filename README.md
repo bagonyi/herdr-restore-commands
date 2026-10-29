@@ -32,6 +32,17 @@ gh dash
 lnav
 ```
 
+Herdr sees a command's arguments but not the variables it was started with.
+If a command needs one, start its line with the assignment, written as you'd
+type it. Restore types it in front of the command:
+
+```
+GH_TOKEN=$(gh auth token --user work-account) gh dash
+```
+
+The assignment is kept as you wrote it, so `$(...)` runs again each time the
+command comes back, and the token itself isn't saved anywhere.
+
 Changes apply from the next save, without a restart.
 
 ## Requirements
@@ -54,7 +65,8 @@ To work on the plugin, clone this repo and link your checkout instead:
 
 The worker starts when a session starts. In a session that was already
 running, run the Save action once to start it, or that session's commands
-come back only from its second restart:
+come back only from its second restart. Run it after an update too, so the
+worker runs the new version:
 
 ```sh
 herdr plugin action invoke save --plugin bagonyi.restore-commands
@@ -62,8 +74,8 @@ herdr plugin action invoke save --plugin bagonyi.restore-commands
 
 ## Actions
 
-- `save` records the listed commands now and starts the worker if it isn't
-  running.
+- `save` records the listed commands now and starts a new worker, which takes
+  over from the running one.
 - `restore` types the saved commands into their panes now, skipping panes
   that are busy.
 

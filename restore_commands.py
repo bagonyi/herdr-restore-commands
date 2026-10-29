@@ -6,6 +6,9 @@ other panes come back as empty shells. This plugin keeps a snapshot of the
 commands running in panes, limited to the ones listed in commands.txt, and
 types each one back into its pane when the session starts again. Pane ids
 keep their number across a restart, so each command returns to its own pane.
+A listed command can come with variable assignments, such as GH_TOKEN=$(...),
+which restore types in front of it: Herdr sees a command's arguments but not
+its environment.
 
 The startup hook hands over to a background worker and returns at once, so it
 doesn't hold one of Herdr's plugin command slots. The worker restores the last
@@ -19,6 +22,7 @@ Usage: restore_commands.py start | work [--restore] | save | restore
 import fcntl
 import json
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -121,37 +125,90 @@ def typed_process(info):
 
 # MARK: Commands
 
-def load_patterns():
-    """The commands to bring back, each as a list of words."""
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def load_listed():
+    """The commands to bring back, each as (words, assignments).
+
+    A line holds a command's first words, optionally after variable
+    assignments written as in a shell: `GH_TOKEN=$(gh auth token) gh dash`.
+    The assignments stay shell text, so `$(...)` runs again on each restore
+    and no token ends up in the snapshot.
+    """
     try:
         with open(COMMANDS_FILE) as f:
             lines = f.read().splitlines()
     except FileNotFoundError:
         return []
-    patterns = []
+    listed = []
     for line in lines:
         line = line.strip()
         if line and not line.startswith("#"):
-            patterns.append(shlex.split(line))
-    return patterns
+            assignments, rest = split_assignments(line)
+            words = shlex.split(rest)
+            if words:
+                listed.append((words, assignments))
+    return listed
 
 
-def wanted(argv, patterns):
-    """Whether argv starts with one of the listed commands' words."""
+def split_assignments(line):
+    """A line's leading variable assignments, as shell text, and the rest."""
+    assignments = []
+    rest = line
+    while ASSIGNMENT.match(rest):
+        end = word_end(rest)
+        assignments.append(rest[:end])
+        rest = rest[end:].lstrip()
+    return " ".join(assignments), rest
+
+
+def word_end(text):
+    """Where the shell word text starts with ends: at its first blank outside
+    quotes, $(...), ${...} and backticks."""
+    closers = []  # What closes each open quote or group, innermost last.
+    i = 0
+    while i < len(text):
+        c = text[i]
+        closer = closers[-1] if closers else None
+        if closer == "'":
+            if c == "'":
+                closers.pop()
+        elif c == "\\":
+            i += 1  # Skip the escaped character.
+        elif c == closer:
+            closers.pop()
+        elif c == "$" and text[i + 1:i + 2] in ("(", "{"):
+            closers.append(")" if text[i + 1] == "(" else "}")
+            i += 1
+        elif c in "\"`" or (c == "'" and closer != '"'):
+            closers.append(c)
+        elif c == "(" and closer == ")":
+            closers.append(")")
+        elif c.isspace() and not closers:
+            break
+        i += 1
+    return min(i, len(text))
+
+
+def listed_match(argv, listed):
+    """The listed (words, assignments) that argv starts with, or None. Of
+    several, the one with the most words."""
     words = [os.path.basename(argv[0]), *argv[1:]]
-    return any(words[:len(pattern)] == pattern for pattern in patterns)
+    matches = [entry for entry in listed if words[:len(entry[0])] == entry[0]]
+    return max(matches, key=lambda entry: len(entry[0]), default=None)
 
 
-def running_commands(patterns):
+def running_commands(listed):
     """Pane id -> the listed command running in it, and the folder it runs in."""
     commands = {}
-    if not patterns:
+    if not listed:
         return commands
     for pane_id, pane in list_panes().items():
         if pane.get("agent"):
             continue  # Herdr resumes agents itself.
         process = typed_process(process_info(pane_id))
-        if process and wanted(process["argv"], patterns):
+        if process and listed_match(process["argv"], listed):
             commands[pane_id] = {
                 "argv": process["argv"],
                 "cwd": process.get("cwd") or pane.get("foreground_cwd") or pane.get("cwd"),
@@ -172,14 +229,17 @@ def shell_quote(word):
     return "'" + word.replace("'", "'\\''") + "'"
 
 
-def shell_text(command, pane):
-    """What to type: the command exactly as it ran, in the folder it ran in.
+def shell_text(command, pane, assignments=""):
+    """What to type: the command exactly as it ran, in the folder it ran in,
+    after the variable assignments listed with it.
 
     `command` skips aliases and shell functions. The saved argv is what ran
     after those were expanded, so expanding them again would change it: an
     alias `lnav='lnav -q'` would turn `lnav -q` into `lnav -q -q`.
     """
     text = "command " + " ".join(shell_quote(word) for word in command["argv"])
+    if assignments:
+        text = f"{assignments} {text}"
     cwd = command.get("cwd")
     if cwd and cwd != (pane.get("foreground_cwd") or pane.get("cwd")):
         text = f"cd {shell_quote(cwd)} && {text}"
@@ -249,6 +309,7 @@ def restore(saved, wait):
 
     Returns (restored, problems), one line per command.
     """
+    listed = load_listed()
     pending = dict(saved)
     typed = {}
     problems = []
@@ -267,10 +328,11 @@ def restore(saved, wait):
             if process and process["argv"] == command["argv"]:
                 del pending[pane_id]  # Already running.
             elif at_prompt(info):
+                match = listed_match(command["argv"], listed)
                 call(
                     "pane.send_input",
                     pane_id=pane_id,
-                    text=shell_text(command, pane),
+                    text=shell_text(command, pane, match[1] if match else ""),
                     keys=["Enter"],
                 )
                 typed[pane_id] = command
@@ -300,17 +362,6 @@ def restore(saved, wait):
 
 def worker_file():
     return session_file(".worker")
-
-
-def worker_running():
-    """Whether a worker holds this session's lock."""
-    with open(session_file(".lock"), "a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        fcntl.flock(lock, fcntl.LOCK_UN)
-        return False
 
 
 def spawn_worker(*args):
@@ -385,7 +436,7 @@ def work(restore_first):
         if time.monotonic() >= next_save:
             next_save = time.monotonic() + SAVE_INTERVAL
             try:
-                running = running_commands(load_patterns())
+                running = running_commands(load_listed())
             except ServerGone:
                 log(f"worker {me} stops: the server is gone")
                 return
@@ -403,14 +454,15 @@ def work(restore_first):
 # MARK: Actions
 
 def save_now():
-    patterns = load_patterns()
-    if not patterns:
+    listed = load_listed()
+    if not listed:
         notify("Nothing to save", f"No commands are listed in {COMMANDS_FILE}")
         return 1
-    commands = running_commands(patterns)
+    commands = running_commands(listed)
     store_snapshot(commands)
-    if not worker_running():
-        spawn_worker()
+    # The new worker takes over from a running one, so after an update the
+    # worker runs the current code without a restart.
+    spawn_worker()
     body = "\n".join(describe(c) for c in commands.values()) or "None of the listed commands is running"
     notify(f"Saved {len(commands)} command(s)", body)
     return 0
