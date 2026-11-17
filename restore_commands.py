@@ -48,8 +48,12 @@ SAVE_INTERVAL = 10  # seconds
 WINDOW_WAIT = 2
 # How long restore waits for a pane's shell to reach its prompt.
 PROMPT_TIMEOUT = 30
-# A typed command can fail at once, so restore looks again after this.
+# A typed command can fail at once, so restore looks again after this. A
+# shell can also take a few seconds to start it, as when every pane's shell
+# starts at once after the Mac starts, so restore keeps looking until
+# VERIFY_TIMEOUT after typing before it calls the command not restored.
 VERIFY_DELAY = 1.5
+VERIFY_TIMEOUT = 6
 # When a session ends, its panes' programs can exit a moment before the server
 # does. A save in that moment would see nothing running and overwrite the
 # snapshot meant to survive the restart. So a command that stopped is
@@ -343,18 +347,26 @@ def restore(saved, wait):
 
     for pane_id, command in pending.items():
         problems.append(f"{describe(command)} in {pane_id}: the pane is busy or gone")
-    restored = []
+    started = set()
     if typed:
         time.sleep(VERIFY_DELAY)
-        for pane_id, command in typed.items():
-            try:
-                running = typed_process(process_info(pane_id))
-            except RuntimeError:
-                running = None
-            if running:
-                restored.append(f"{describe(command)} in {pane_id}")
-            else:
-                problems.append(f"{describe(command)} in {pane_id}: exited right away")
+        deadline = time.monotonic() + VERIFY_TIMEOUT - VERIFY_DELAY
+        while True:
+            for pane_id in typed.keys() - started:
+                try:
+                    if typed_process(process_info(pane_id)):
+                        started.add(pane_id)
+                except RuntimeError:
+                    pass  # The pane closed; it counts as not running.
+            if len(started) == len(typed) or time.monotonic() >= deadline:
+                break
+            time.sleep(0.5)
+    restored = []
+    for pane_id, command in typed.items():
+        if pane_id in started:
+            restored.append(f"{describe(command)} in {pane_id}")
+        else:
+            problems.append(f"{describe(command)} in {pane_id}: exited right away")
     return restored, problems
 
 
